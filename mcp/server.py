@@ -2,9 +2,16 @@
 Trello Deep — MCP-сервер.
 
 Закрывает четыре пробела штатного Trello-коннектора: вложения (список +
-скачивание), комментарии, история изменений. На этапе 1 реализован только
-`trello_fetch_attachment` — единственный неочевидный риск во всей затее:
-доезжает ли скачанный файл до файловой системы, которую видит агент.
+скачивание), комментарии, история изменений. Плюс два пишущих инструмента
+(комментарий, загрузка файла) с обязательным подтверждением.
+
+Инструменты:
+  - trello_fetch_attachment   скачать вложение на диск (read)
+  - trello_list_attachments   список вложений          (read)
+  - trello_get_comments       комментарии карточки      (read)
+  - trello_get_card_history   история изменений         (read)
+  - trello_add_comment        добавить комментарий      (write, confirm)
+  - trello_upload_attachment  прикрепить файл           (write, confirm)
 
 Ключ и токен читаются ИСКЛЮЧИТЕЛЬНО из переменных окружения
 TRELLO_KEY и TRELLO_TOKEN (или из .env рядом). Хардкод недопустим.
@@ -18,7 +25,7 @@ from pathlib import Path
 from urllib.parse import quote
 
 import httpx
-from dotenv import load_dotenv
+from dotenv import dotenv_values, load_dotenv
 from mcp.server.fastmcp import FastMCP
 
 # .env ищем рядом с этим файлом и на уровень выше (корень репозитория).
@@ -26,9 +33,15 @@ _HERE = Path(__file__).resolve().parent
 load_dotenv(_HERE / ".env")
 load_dotenv(_HERE.parent / ".env")
 
+# Значения из .env как явный фолбэк. Нужно на случай запуска плагином:
+# .mcp.json может подставить пустой TRELLO_KEY="", а load_dotenv (без override)
+# пустую переменную окружения из .env не перезапишет. Системная переменная
+# приоритетна; при её отсутствии или пустоте берём значение из .env.
+_DOTENV = {**dotenv_values(_HERE.parent / ".env"), **dotenv_values(_HERE / ".env")}
+
 API = "https://api.trello.com/1"
-KEY = os.environ.get("TRELLO_KEY")
-TOKEN = os.environ.get("TRELLO_TOKEN")
+KEY = os.environ.get("TRELLO_KEY") or _DOTENV.get("TRELLO_KEY")
+TOKEN = os.environ.get("TRELLO_TOKEN") or _DOTENV.get("TRELLO_TOKEN")
 
 mcp = FastMCP("trello-deep")
 
@@ -71,6 +84,17 @@ async def _api_get(path: str, **params):
     _require_creds()
     async with httpx.AsyncClient(timeout=60) as client:
         return await _get_json(client, path, **params)
+
+
+async def _api_post(path: str, *, data: dict | None = None, files: dict | None = None):
+    """Разовый POST к Trello (пишущие тулы). Авторизация через key/token
+    query-параметрами — для JSON-эндпоинтов это допустимо и надёжно для POST."""
+    _require_creds()
+    params = {"key": KEY, "token": TOKEN}
+    async with httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=30.0)) as client:
+        r = await client.post(f"{API}{path}", params=params, data=data, files=files)
+        _raise_for_trello(r, path)
+        return r.json()
 
 
 async def _get_json(client: httpx.AsyncClient, path: str, **params):
@@ -282,6 +306,149 @@ async def trello_get_card_history(
         }
         for a in actions
     ]
+
+
+# --------------------------------------------------------------------------
+# Этап 3: пишущие инструменты (необратимы силами плагина — требуют confirm)
+# --------------------------------------------------------------------------
+#
+# Удаления в плагине нет намеренно: инструментов, стирающих карточки,
+# комментарии или вложения, здесь быть не должно. Поэтому всё, что публикуется,
+# плагин откатить не может. Оба инструмента защищены параметром confirm:
+# без confirm=True они НЕ пишут, а возвращают предпросмотр действия. Агент
+# обязан сначала показать этот предпросмотр пользователю и получить явное «да».
+
+COMMENT_MAX = 16384          # лимит Trello на длину комментария
+MAX_UPLOAD = 250 * 1024 * 1024  # жёсткий максимум вложения Trello (платный тариф)
+
+
+@mcp.tool()
+async def trello_add_comment(card: str, text: str, confirm: bool = False) -> dict:
+    """Публикует комментарий на карточке Trello от имени владельца токена.
+
+    ВНИМАНИЕ: действие необратимо силами плагина (удаления в плагине нет).
+    Упоминания через @username порождают реальные уведомления живым людям —
+    не рассылай их без явной просьбы пользователя.
+
+    Механизм подтверждения: при confirm=False (по умолчанию) инструмент НИЧЕГО
+    не публикует, а возвращает предпросмотр. Покажи предпросмотр пользователю,
+    получи явное согласие и только тогда вызови повторно с confirm=True.
+
+    Аргументы:
+        card: URL карточки, shortLink или полный id.
+        text: текст комментария (поддерживается Markdown). Длиннее 16384
+            символов — режется на несколько комментариев, а не теряется.
+        confirm: True — публиковать. False — только предпросмотр.
+
+    Возвращает при confirm=False: {"pending_confirmation": true, ...предпросмотр}.
+    Возвращает при confirm=True:  {"posted": N, "comments": [{id, date, author}]}.
+    """
+    _require_creds()
+    if not text or not text.strip():
+        raise TrelloError("Пустой текст комментария.")
+    card_n = _normalize_card(card)
+    chunks = [text[i : i + COMMENT_MAX] for i in range(0, len(text), COMMENT_MAX)]
+
+    if not confirm:
+        return {
+            "pending_confirmation": True,
+            "action": "add_comment",
+            "card": card_n,
+            "parts": len(chunks),
+            "chars": len(text),
+            "mentions": bool(re.search(r"(?:^|\s)@[\w-]+", text)),
+            "preview": text[:500],
+            "note": (
+                "Комментарий НЕ опубликован. Необратимо силами плагина. "
+                "@упоминания шлют реальные уведомления людям. "
+                "После явного согласия пользователя вызови снова с confirm=True."
+            ),
+        }
+
+    created = []
+    for chunk in chunks:
+        res = await _api_post(
+            f"/cards/{card_n}/actions/comments", data={"text": chunk}
+        )
+        created.append(
+            {
+                "id": res.get("id"),
+                "date": res.get("date"),
+                "author": res.get("memberCreator", {}).get("fullName"),
+            }
+        )
+    return {"posted": len(created), "comments": created}
+
+
+@mcp.tool()
+async def trello_upload_attachment(
+    card: str,
+    file_path: str,
+    name: str | None = None,
+    confirm: bool = False,
+) -> dict:
+    """Прикрепляет локальный файл к карточке Trello.
+
+    ВНИМАНИЕ: действие необратимо силами плагина (удаления в плагине нет).
+
+    Механизм подтверждения: при confirm=False (по умолчанию) инструмент НИЧЕГО
+    не прикрепляет, а возвращает предпросмотр. Покажи его пользователю, получи
+    явное согласие и только тогда вызови повторно с confirm=True.
+
+    Аргументы:
+        card: URL карточки, shortLink или полный id.
+        file_path: путь к локальному файлу (проверяется до отправки).
+        name: имя вложения. По умолчанию — имя файла.
+        confirm: True — прикреплять. False — только предпросмотр.
+
+    Лимит размера зависит от тарифа рабочего пространства: 10 МБ на бесплатном,
+    до 250 МБ на платных. Файл больше 250 МБ отклоняется до отправки.
+
+    Возвращает при confirm=False: {"pending_confirmation": true, ...предпросмотр}.
+    Возвращает при confirm=True:  {id, name, bytes, mime, url}.
+    """
+    _require_creds()
+    p = Path(file_path)
+    if not p.exists() or not p.is_file():
+        raise TrelloError(f"Файл не найден: {file_path}")
+    size = p.stat().st_size
+    if size > MAX_UPLOAD:
+        raise TrelloError(
+            f"Файл {size / 1e6:.1f} МБ превышает максимум Trello 250 МБ."
+        )
+    card_n = _normalize_card(card)
+    att_name = name or p.name
+
+    if not confirm:
+        return {
+            "pending_confirmation": True,
+            "action": "upload_attachment",
+            "card": card_n,
+            "file": str(p),
+            "name": att_name,
+            "bytes": size,
+            "note": (
+                f"Файл НЕ прикреплён. Необратимо силами плагина. "
+                f"Размер {size / 1e6:.1f} МБ (на бесплатном тарифе лимит 10 МБ, "
+                f"на платных до 250 МБ). После согласия пользователя вызови "
+                f"снова с confirm=True."
+            ),
+        }
+
+    mime = mimetypes.guess_type(str(p))[0] or "application/octet-stream"
+    with open(p, "rb") as fh:
+        res = await _api_post(
+            f"/cards/{card_n}/attachments",
+            data={"name": att_name},
+            files={"file": (att_name, fh, mime)},
+        )
+    return {
+        "id": res.get("id"),
+        "name": res.get("name"),
+        "bytes": res.get("bytes"),
+        "mime": res.get("mimeType"),
+        "url": res.get("url"),
+    }
 
 
 if __name__ == "__main__":

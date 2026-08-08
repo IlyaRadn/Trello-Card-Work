@@ -1,0 +1,23 @@
+{
+  "name": "trello-deep",
+  "displayName": "Trello Deep",
+  "version": "1.0.0",
+  "description": "Читает вложения, комментарии и историю карточек Trello — то, чего не отдаёт штатный коннектор. Скачивает файлы на диск (видны нативно), умеет писать комментарии и прикреплять файлы с подтверждением.",
+  "author": {
+    "name": "Duck.design",
+    "email": "hello@duck.design"
+  },
+  "homepage": "https://github.com/IlyaRadn/Trello-Card-Work",
+  "license": "MIT",
+  "keywords": ["trello", "mcp", "attachments", "comments"],
+  "mcpServers": {
+    "trello-deep": {
+      "command": "python",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/mcp/server.py"],
+      "env": {
+        "TRELLO_KEY": "${TRELLO_KEY:-}",
+        "TRELLO_TOKEN": "${TRELLO_TOKEN:-}"
+      }
+    }
+  }
+}
