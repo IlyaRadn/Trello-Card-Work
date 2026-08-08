@@ -1,0 +1,28 @@
+# --- Секреты: НИКОГДА не коммитить ---
+.env
+.env.local
+*.env
+
+# --- Скачанные вложения ---
+trello_files/
+scripts/trello_files/
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# --- ОС / редакторы ---
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
