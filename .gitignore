@@ -26,3 +26,6 @@ env/
 Thumbs.db
 .vscode/
 .idea/
+
+# превью иконки (не нужно в репо)
+assets/_preview.png
