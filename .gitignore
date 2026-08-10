@@ -3,6 +3,9 @@
 .env.local
 *.env
 
+# --- Локальная конфигурация (машинно-зависимые пути, генерит install.ps1) ---
+.mcp.json
+
 # --- Скачанные вложения ---
 trello_files/
 scripts/trello_files/
