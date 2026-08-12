@@ -73,6 +73,20 @@ cp .env.example .env      # вписать TRELLO_KEY и TRELLO_TOKEN
 > правам). Общий — только API key. `.env` и `.mcp.json` в `.gitignore`, в
 > репозиторий не попадают.
 
+### macOS / Linux
+
+То же самое, но установщик — `install.sh`:
+```bash
+git clone https://github.com/IlyaRadn/Trello-Card-Work.git
+cd Trello-Card-Work
+bash install.sh
+```
+Дальше так же: открыть папку в Claude как проект → перезапустить → `/mcp`.
+
+> **iOS / Android не поддерживаются:** плагин запускает локальный сервер и пишет
+> файлы на диск — на мобильных ОС это невозможно. Мобильный доступ потребует
+> отдельной реализации в виде удалённого HTTP-коннектора.
+
 ## Подключение как плагина Claude Code (вручную)
 
 Манифест `.claude-plugin/plugin.json` уже описывает MCP-сервер. Сервер берёт
