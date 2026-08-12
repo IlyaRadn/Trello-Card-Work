@@ -1,0 +1,5 @@
+# Нормализация переносов строк, чтобы скрипты работали на своей ОС.
+* text=auto
+*.sh  text eol=lf
+*.ps1 text eol=crlf
+*.py  text eol=lf
