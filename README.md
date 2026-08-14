@@ -14,6 +14,7 @@ MCP-плагин, закрывающий четыре пробела штатн�
 | Инструмент | Назначение | Права |
 |---|---|---|
 | `trello_fetch_attachment` | Скачать вложение на диск, вернуть путь | read |
+| `trello_read_attachment_text` | Извлечь текст брифа (PDF / docx / txt) — на любой машине | read |
 | `trello_list_attachments` | Список вложений (файлы/ссылки по `is_upload`) | read |
 | `trello_get_comments` | Комментарии карточки | read |
 | `trello_get_card_history` | История изменений | read |

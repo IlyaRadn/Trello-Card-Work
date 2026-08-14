@@ -6,10 +6,11 @@ Trello Deep — MCP-сервер.
 (комментарий, загрузка файла) с обязательным подтверждением.
 
 Инструменты:
-  - trello_fetch_attachment   скачать вложение на диск (read)
-  - trello_list_attachments   список вложений          (read)
-  - trello_get_comments       комментарии карточки      (read)
-  - trello_get_card_history   история изменений         (read)
+  - trello_fetch_attachment      скачать вложение на диск (read)
+  - trello_read_attachment_text  извлечь текст брифа PDF/docx (read)
+  - trello_list_attachments      список вложений          (read)
+  - trello_get_comments          комментарии карточки      (read)
+  - trello_get_card_history      история изменений         (read)
   - trello_add_comment        добавить комментарий      (write, confirm)
   - trello_upload_attachment  прикрепить файл           (write, confirm)
 
@@ -25,23 +26,20 @@ from pathlib import Path
 from urllib.parse import quote
 
 import httpx
-from dotenv import dotenv_values, load_dotenv
+from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
 
-# .env ищем рядом с этим файлом и на уровень выше (корень репозитория).
+# .env авторитетнее переменных окружения процесса: install.ps1/.sh пишут токен
+# именно в .env, и он должен побеждать возможный УСТАРЕВШИЙ TRELLO_TOKEN, который
+# мог остаться в окружении (иначе плагин молча ходит со старым токеном -> 401).
+# Если .env нет — используются системные переменные окружения как есть.
 _HERE = Path(__file__).resolve().parent
-load_dotenv(_HERE / ".env")
-load_dotenv(_HERE.parent / ".env")
-
-# Значения из .env как явный фолбэк. Нужно на случай запуска плагином:
-# .mcp.json может подставить пустой TRELLO_KEY="", а load_dotenv (без override)
-# пустую переменную окружения из .env не перезапишет. Системная переменная
-# приоритетна; при её отсутствии или пустоте берём значение из .env.
-_DOTENV = {**dotenv_values(_HERE.parent / ".env"), **dotenv_values(_HERE / ".env")}
+load_dotenv(_HERE.parent / ".env", override=True)   # .env в корне репозитория
+load_dotenv(_HERE / ".env", override=True)          # .env рядом с server.py, если есть
 
 API = "https://api.trello.com/1"
-KEY = os.environ.get("TRELLO_KEY") or _DOTENV.get("TRELLO_KEY")
-TOKEN = os.environ.get("TRELLO_TOKEN") or _DOTENV.get("TRELLO_TOKEN")
+KEY = os.environ.get("TRELLO_KEY")
+TOKEN = os.environ.get("TRELLO_TOKEN")
 
 mcp = FastMCP("trello-deep")
 
@@ -306,6 +304,106 @@ async def trello_get_card_history(
         }
         for a in actions
     ]
+
+
+def _extract_text(path: Path):
+    """Возвращает (текст, вид) из файла или (None, суффикс) для нетекстовых.
+    PDF/docx читаются библиотеками — не зависит от того, умеет ли среда их открыть."""
+    suf = path.suffix.lower()
+    if suf == ".pdf":
+        try:
+            import pymupdf
+        except ImportError as e:
+            raise TrelloError(
+                "Для чтения PDF нужен pymupdf. Установи зависимости: "
+                "pip install -r mcp/requirements.txt"
+            ) from e
+        doc = pymupdf.open(path)
+        return ("\n".join(pg.get_text() for pg in doc), "pdf")
+    if suf == ".docx":
+        try:
+            import docx
+        except ImportError as e:
+            raise TrelloError(
+                "Для чтения docx нужен python-docx. Установи зависимости: "
+                "pip install -r mcp/requirements.txt"
+            ) from e
+        d = docx.Document(path)
+        parts = [p.text for p in d.paragraphs if p.text.strip()]
+        for tbl in d.tables:
+            for row in tbl.rows:
+                cells = [c.text.strip() for c in row.cells]
+                if any(cells):
+                    parts.append(" | ".join(cells))
+        return ("\n".join(parts), "docx")
+    if suf in (".txt", ".md", ".csv", ".json", ".log", ".yaml", ".yml"):
+        return (path.read_text(encoding="utf-8", errors="replace"), suf.lstrip("."))
+    return (None, suf)
+
+
+@mcp.tool()
+async def trello_read_attachment_text(
+    card: str,
+    attachment_id: str,
+    max_chars: int = 20000,
+    dest_dir: str = "./trello_files",
+) -> dict:
+    """Скачивает вложение и возвращает извлечённый ТЕКСТ (для брифов: PDF, docx, txt/md/csv).
+
+    Работает на любой машине, не завися от того, умеет ли среда открывать PDF/docx.
+    Для картинок используй trello_fetch_attachment и посмотри файл глазами.
+
+    Аргументы:
+        card: URL карточки, shortLink или полный id.
+        attachment_id: id вложения (см. trello_list_attachments).
+        max_chars: максимум символов в ответе (по умолчанию 20000, чтобы не забить контекст).
+        dest_dir: куда сохранить файл. По умолчанию "./trello_files".
+
+    Возвращает для текстового файла: {"path", "name", "kind", "chars", "truncated", "text"}.
+    Возвращает для нетекстового:      {"path", "name", "mime", "extractable": false, "note"}.
+    Возвращает для внешней ссылки:    {"is_link": true, "url", "name", "text": null}.
+    """
+    _require_creds()
+    card = _normalize_card(card)
+
+    async with httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=30.0)) as client:
+        meta = await _get_json(
+            client, f"/cards/{card}/attachments/{attachment_id}", fields="all"
+        )
+        if not meta.get("isUpload", False):
+            return {
+                "is_link": True,
+                "url": meta.get("url"),
+                "name": meta.get("name"),
+                "text": None,
+            }
+        file_name = meta.get("fileName") or meta.get("name") or attachment_id
+        url = f"{API}/cards/{card}/attachments/{attachment_id}/download/{quote(file_name)}"
+        dest = Path(dest_dir)
+        dest.mkdir(parents=True, exist_ok=True)
+        path = dest / file_name
+        await _stream_download(client, url, path)
+
+    text, kind = _extract_text(path)
+    if text is None:
+        return {
+            "path": str(path),
+            "name": file_name,
+            "mime": meta.get("mimeType"),
+            "extractable": False,
+            "note": (
+                f"Тип «{kind}» не текстовый — файл скачан по указанному пути, "
+                f"открой его как файл (картинку — посмотри глазами, архив — распакуй)."
+            ),
+        }
+    return {
+        "path": str(path),
+        "name": file_name,
+        "kind": kind,
+        "chars": len(text),
+        "truncated": len(text) > max_chars,
+        "text": text[:max_chars],
+    }
 
 
 # --------------------------------------------------------------------------
