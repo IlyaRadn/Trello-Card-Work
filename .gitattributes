@@ -3,3 +3,9 @@
 *.sh  text eol=lf
 *.ps1 text eol=crlf
 *.py  text eol=lf
+
+# Бинарные ассеты (шрифты vendored-скиллов) — не трогать переносы строк
+*.ttf binary
+*.otf binary
+*.png binary
+*.pdf binary
