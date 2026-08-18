@@ -18,6 +18,7 @@ MCP-плагин, закрывающий четыре пробела штатн�
 | `trello_list_attachments` | Список вложений (файлы/ссылки по `is_upload`) | read |
 | `trello_get_comments` | Комментарии карточки | read |
 | `trello_get_card_history` | История изменений | read |
+| `trello_bulk_fetch_board` | Вложения+комментарии по всей доске (опц. скачать) | read |
 | `trello_add_comment` | Добавить комментарий (с подтверждением) | write |
 | `trello_upload_attachment` | Прикрепить файл (с подтверждением) | write |
 

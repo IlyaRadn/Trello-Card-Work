@@ -78,6 +78,14 @@ def _normalize_card(card: str) -> str:
     return card.strip()
 
 
+def _normalize_board(board: str) -> str:
+    """URL доски -> shortLink. shortLink и полный id пропускает как есть."""
+    m = re.search(r"/b/([A-Za-z0-9]+)", board)
+    if m:
+        return m.group(1)
+    return board.strip()
+
+
 async def _api_get(path: str, **params):
     """Разовый GET JSON: создаёт клиент, вызывает _get_json. Для читающих тулов."""
     _require_creds()
@@ -348,6 +356,97 @@ async def trello_get_card_history(
         }
         for a in actions
     ]
+
+
+@mcp.tool()
+async def trello_bulk_fetch_board(
+    board: str,
+    download: bool = False,
+    dest_dir: str = "./trello_files",
+    include_comments: bool = True,
+    max_cards: int = 300,
+) -> dict:
+    """Собирает по ВСЕЙ доске Trello: карточки, их вложения и комментарии — одним вызовом.
+
+    Для аудита доски. По умолчанию НЕ скачивает файлы (только опись + комментарии),
+    т.к. вся доска может весить гигабайты. С download=True скачивает загруженные
+    вложения (в подпапки по карточкам, с кэшем); внешние ссылки пропускает.
+
+    Аргументы:
+        board: URL доски, shortLink или id.
+        download: True — скачать файлы на диск. False — только опись (по умолчанию).
+        dest_dir: куда качать. По умолчанию "./trello_files".
+        include_comments: включать ли комментарии карточек. По умолчанию True.
+        max_cards: ограничение числа карточек в ответе (по умолчанию 300).
+
+    Возвращает: {board, cards, attachments_total, downloaded, items:[{card, url,
+    attachments:[{id,name,mime,bytes,is_upload,url,(path,cached)}], comments:[...]}]}.
+    Совет: для лёгкой описи ставь download=False; при большом объёме — include_comments=False.
+    """
+    _require_creds()
+    board = _normalize_board(board)
+
+    cards = await _api_get(
+        f"/boards/{board}/cards", fields="name,shortLink,url",
+        attachments="true", attachment_fields="all", limit=1000,
+    )
+
+    comments_by_card: dict[str, list] = {}
+    if include_comments:
+        actions = await _api_get(
+            f"/boards/{board}/actions", filter="commentCard", limit=1000
+        )
+        for a in actions:
+            cid = ((a.get("data") or {}).get("card") or {}).get("id")
+            if not cid:
+                continue
+            comments_by_card.setdefault(cid, []).append({
+                "author": a.get("memberCreator", {}).get("fullName", "—"),
+                "date": a.get("date"),
+                "text": (a.get("data") or {}).get("text", ""),
+            })
+
+    items = []
+    total_att = downloaded = 0
+    async with httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=30.0)) as client:
+        for c in cards[:max_cards]:
+            card_key = c.get("shortLink") or c.get("id")
+            atts = []
+            for a in c.get("attachments") or []:
+                is_up = bool(a.get("isUpload"))
+                entry = {
+                    "id": a.get("id"),
+                    "name": a.get("fileName") if is_up else a.get("name"),
+                    "mime": a.get("mimeType"),
+                    "bytes": a.get("bytes"),
+                    "is_upload": is_up,
+                    "url": a.get("url"),
+                }
+                if download and is_up:
+                    sub = str(Path(dest_dir) / card_key)
+                    path, cached = await _download_attachment(client, card_key, a, sub)
+                    entry["path"] = str(path)
+                    entry["cached"] = cached
+                    downloaded += 1
+                atts.append(entry)
+            total_att += len(atts)
+            items.append({
+                "card": c.get("name"),
+                "shortLink": c.get("shortLink"),
+                "url": c.get("url"),
+                "attachments": atts,
+                "comments": comments_by_card.get(c.get("id"), []),
+            })
+
+    return {
+        "board": board,
+        "cards": len(items),
+        "cards_total": len(cards),
+        "truncated": len(cards) > max_cards or len(cards) >= 1000,
+        "attachments_total": total_att,
+        "downloaded": downloaded if download else 0,
+        "items": items,
+    }
 
 
 def _extract_text(path: Path):
