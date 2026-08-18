@@ -6,9 +6,10 @@
 # --- Локальная конфигурация (машинно-зависимые пути, генерит install.ps1) ---
 .mcp.json
 
-# --- Скачанные вложения ---
+# --- Скачанные вложения и кэш ---
 trello_files/
 scripts/trello_files/
+.trello_cache.json
 
 # --- Python ---
 __pycache__/

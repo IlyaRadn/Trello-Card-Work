@@ -19,6 +19,7 @@ TRELLO_KEY и TRELLO_TOKEN (или из .env рядом). Хардкод нед�
 """
 
 import asyncio
+import json
 import mimetypes
 import os
 import re
@@ -166,22 +167,15 @@ async def trello_fetch_attachment(
                 "path": None,
             }
 
-        file_name = meta.get("fileName") or meta.get("name") or attachment_id
-        # Имена содержат пробелы и скобки ("TLC_banners (4).zip") — обязательно quote().
-        url = f"{API}/cards/{card}/attachments/{attachment_id}/download/{quote(file_name)}"
-
-        dest = Path(dest_dir)
-        dest.mkdir(parents=True, exist_ok=True)
-        path = dest / file_name
-
-        size = await _stream_download(client, url, path)
+        path, cached = await _download_attachment(client, card, meta, dest_dir)
 
     mime = meta.get("mimeType") or mimetypes.guess_type(str(path))[0] or "application/octet-stream"
     return {
         "path": str(path),
-        "bytes": size,
+        "bytes": path.stat().st_size,
         "mime": mime,
         "is_link": False,
+        "cached": cached,
     }
 
 
@@ -210,6 +204,56 @@ async def _stream_download(client: httpx.AsyncClient, url: str, path: Path) -> i
                 continue
             raise TrelloError(f"Сеть: не удалось скачать {path.name}: {e}") from e
     raise TrelloError(f"Не удалось скачать {path.name} после 3 попыток (429).")
+
+
+# --------------------------------------------------------------------------
+# Кэш вложений: не перекачивать файл, если он не менялся
+# --------------------------------------------------------------------------
+
+def _cache_path(dest: Path) -> Path:
+    return dest / ".trello_cache.json"
+
+
+def _read_cache(dest: Path) -> dict:
+    p = _cache_path(dest)
+    if p.exists():
+        try:
+            return json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+    return {}
+
+
+def _write_cache(dest: Path, cache: dict) -> None:
+    try:
+        _cache_path(dest).write_text(json.dumps(cache, ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        pass
+
+
+async def _download_attachment(client: httpx.AsyncClient, card: str, meta: dict, dest_dir: str):
+    """Скачивает вложение с кэшем. Если файл уже скачан и не менялся
+    (совпадают id + размер + дата в манифесте .trello_cache.json), возвращает его
+    без повторной загрузки. Возвращает (path, cached: bool)."""
+    aid = meta["id"]
+    file_name = meta.get("fileName") or meta.get("name") or aid
+    size = meta.get("bytes")
+    date = meta.get("date")
+    dest = Path(dest_dir)
+    dest.mkdir(parents=True, exist_ok=True)
+    path = dest / file_name
+
+    cache = _read_cache(dest)
+    ent = cache.get(aid)
+    if (path.exists() and ent and ent.get("bytes") == size and ent.get("date") == date
+            and (size is None or path.stat().st_size == size)):
+        return path, True  # кэш-хит: файл на месте и не менялся
+
+    url = f"{API}/cards/{card}/attachments/{aid}/download/{quote(file_name)}"
+    await _stream_download(client, url, path)
+    cache[aid] = {"name": file_name, "bytes": size, "date": date}
+    _write_cache(dest, cache)
+    return path, False
 
 
 # --------------------------------------------------------------------------
@@ -377,12 +421,8 @@ async def trello_read_attachment_text(
                 "name": meta.get("name"),
                 "text": None,
             }
-        file_name = meta.get("fileName") or meta.get("name") or attachment_id
-        url = f"{API}/cards/{card}/attachments/{attachment_id}/download/{quote(file_name)}"
-        dest = Path(dest_dir)
-        dest.mkdir(parents=True, exist_ok=True)
-        path = dest / file_name
-        await _stream_download(client, url, path)
+        path, cached = await _download_attachment(client, card, meta, dest_dir)
+        file_name = path.name
 
     text, kind = _extract_text(path)
     if text is None:
@@ -391,6 +431,7 @@ async def trello_read_attachment_text(
             "name": file_name,
             "mime": meta.get("mimeType"),
             "extractable": False,
+            "cached": cached,
             "note": (
                 f"Тип «{kind}» не текстовый — файл скачан по указанному пути, "
                 f"открой его как файл (картинку — посмотри глазами, архив — распакуй)."
@@ -400,6 +441,7 @@ async def trello_read_attachment_text(
         "path": str(path),
         "name": file_name,
         "kind": kind,
+        "cached": cached,
         "chars": len(text),
         "truncated": len(text) > max_chars,
         "text": text[:max_chars],
