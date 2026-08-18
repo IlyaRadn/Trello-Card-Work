@@ -239,6 +239,9 @@ def _write_cache(dest: Path, cache: dict) -> None:
         pass
 
 
+_cache_lock = asyncio.Lock()  # защита манифеста кэша при параллельных загрузках
+
+
 async def _download_attachment(client: httpx.AsyncClient, card: str, meta: dict, dest_dir: str):
     """Скачивает вложение с кэшем. Если файл уже скачан и не менялся
     (совпадают id + размер + дата в манифесте .trello_cache.json), возвращает его
@@ -259,8 +262,10 @@ async def _download_attachment(client: httpx.AsyncClient, card: str, meta: dict,
 
     url = f"{API}/cards/{card}/attachments/{aid}/download/{quote(file_name)}"
     await _stream_download(client, url, path)
-    cache[aid] = {"name": file_name, "bytes": size, "date": date}
-    _write_cache(dest, cache)
+    async with _cache_lock:  # перечитываем и мержим, чтобы параллель не затёрла кэш
+        fresh = _read_cache(dest)
+        fresh[aid] = {"name": file_name, "bytes": size, "date": date}
+        _write_cache(dest, fresh)
     return path, False
 
 
@@ -408,35 +413,46 @@ async def trello_bulk_fetch_board(
 
     items = []
     total_att = downloaded = 0
-    async with httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=30.0)) as client:
-        for c in cards[:max_cards]:
-            card_key = c.get("shortLink") or c.get("id")
-            atts = []
-            for a in c.get("attachments") or []:
-                is_up = bool(a.get("isUpload"))
-                entry = {
-                    "id": a.get("id"),
-                    "name": a.get("fileName") if is_up else a.get("name"),
-                    "mime": a.get("mimeType"),
-                    "bytes": a.get("bytes"),
-                    "is_upload": is_up,
-                    "url": a.get("url"),
-                }
-                if download and is_up:
-                    sub = str(Path(dest_dir) / card_key)
-                    path, cached = await _download_attachment(client, card_key, a, sub)
-                    entry["path"] = str(path)
-                    entry["cached"] = cached
-                    downloaded += 1
-                atts.append(entry)
-            total_att += len(atts)
-            items.append({
-                "card": c.get("name"),
-                "shortLink": c.get("shortLink"),
-                "url": c.get("url"),
-                "attachments": atts,
-                "comments": comments_by_card.get(c.get("id"), []),
-            })
+    jobs = []  # (entry, card_key, meta, dest) для параллельного скачивания
+    for c in cards[:max_cards]:
+        card_key = c.get("shortLink") or c.get("id")
+        atts = []
+        for a in c.get("attachments") or []:
+            is_up = bool(a.get("isUpload"))
+            entry = {
+                "id": a.get("id"),
+                "name": a.get("fileName") if is_up else a.get("name"),
+                "mime": a.get("mimeType"),
+                "bytes": a.get("bytes"),
+                "is_upload": is_up,
+                "url": a.get("url"),
+            }
+            if download and is_up:
+                jobs.append((entry, card_key, a, str(Path(dest_dir) / card_key)))
+            atts.append(entry)
+        total_att += len(atts)
+        items.append({
+            "card": c.get("name"),
+            "shortLink": c.get("shortLink"),
+            "url": c.get("url"),
+            "attachments": atts,
+            "comments": comments_by_card.get(c.get("id"), []),
+        })
+
+    if jobs:
+        # Параллельное скачивание с ограничением (лимиты Trello ~300 req/10s).
+        sem = asyncio.Semaphore(6)
+        async with httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=30.0)) as client:
+            async def _run(entry, ck, meta, dest):
+                async with sem:
+                    try:
+                        p, cached = await _download_attachment(client, ck, meta, dest)
+                        entry["path"] = str(p)
+                        entry["cached"] = cached
+                    except Exception as e:  # noqa: BLE001
+                        entry["error"] = str(e)
+            await asyncio.gather(*(_run(*j) for j in jobs))
+        downloaded = sum(1 for j in jobs if "path" in j[0])
 
     return {
         "board": board,
@@ -447,6 +463,112 @@ async def trello_bulk_fetch_board(
         "downloaded": downloaded if download else 0,
         "items": items,
     }
+
+
+@mcp.tool()
+async def trello_extract_archive(
+    card: str,
+    attachment_id: str,
+    dest_dir: str = "./trello_files",
+) -> dict:
+    """Скачивает вложение-архив и распаковывает его. Возвращает список файлов внутри.
+
+    ZIP распаковывается штатно. Для .rar/.7z нужен внешний распаковщик (7-Zip/unrar) —
+    в этом случае возвращается путь к скачанному архиву и пометка.
+
+    Аргументы:
+        card: URL карточки, shortLink или id.
+        attachment_id: id вложения-архива.
+        dest_dir: куда скачать/распаковать. По умолчанию "./trello_files".
+
+    Возвращает: {"path", "unpacked_to", "count", "files":[...до 200], "cached"} для zip;
+    для не-zip архивов — {"path", "note", "cached"}.
+    """
+    _require_creds()
+    import zipfile
+    card = _normalize_card(card)
+    async with httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=30.0)) as client:
+        meta = await _get_json(
+            client, f"/cards/{card}/attachments/{attachment_id}", fields="all"
+        )
+        if not meta.get("isUpload", False):
+            return {"is_link": True, "url": meta.get("url"), "name": meta.get("name")}
+        path, cached = await _download_attachment(client, card, meta, dest_dir)
+
+    if path.suffix.lower() == ".zip":
+        target = path.with_name(path.stem + "_unpacked")
+        with zipfile.ZipFile(path) as z:
+            z.extractall(target)
+        files = sorted(
+            str(p.relative_to(target)) for p in target.rglob("*")
+            if p.is_file() and "__MACOSX" not in str(p)
+        )
+        return {
+            "path": str(path), "unpacked_to": str(target),
+            "count": len(files), "files": files[:200], "cached": cached,
+        }
+    if path.suffix.lower() in (".rar", ".7z"):
+        return {
+            "path": str(path), "cached": cached,
+            "note": f"{path.suffix} требует внешнего распаковщика (7-Zip/unrar). "
+                    f"ZIP плагин распаковывает сам.",
+        }
+    return {"path": str(path), "cached": cached, "note": "не архив"}
+
+
+@mcp.tool()
+async def trello_contact_sheet(
+    images_dir: str,
+    out_path: str | None = None,
+    cols: int = 5,
+    cell: int = 320,
+    max_images: int = 60,
+) -> dict:
+    """Собирает контактный лист (montage) из картинок в папке — чтобы обозреть
+    большой набор фото одним изображением (дёшево по токенам). Возвращает путь.
+
+    Аргументы:
+        images_dir: папка с картинками (напр. распакованный архив съёмки).
+        out_path: куда сохранить лист. По умолчанию <images_dir>/_contact_sheet.png.
+        cols: колонок в сетке (по умолчанию 5).
+        cell: размер ячейки в px (по умолчанию 320).
+        max_images: сколько картинок показать (равномерная выборка, по умолчанию 60).
+
+    Возвращает: {"path", "images_total", "shown"}.
+    """
+    import math
+    from PIL import Image
+    d = Path(images_dir)
+    if not d.exists():
+        raise TrelloError(f"Папка не найдена: {images_dir}")
+    exts = (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif")
+    imgs = sorted(
+        p for p in d.rglob("*")
+        if p.suffix.lower() in exts and "__MACOSX" not in str(p) and "_contact_sheet" not in p.name
+    )
+    if not imgs:
+        raise TrelloError(f"Картинок не найдено в {images_dir}")
+    step = max(1, len(imgs) // max_images)
+    sample = imgs[::step][:max_images]
+
+    rows = math.ceil(len(sample) / cols)
+    pad = 6
+    W = cols * (cell + pad) + pad
+    H = rows * (cell + pad) + pad
+    canvas = Image.new("RGB", (W, H), (238, 238, 240))
+    for i, p in enumerate(sample):
+        r, c = divmod(i, cols)
+        x = pad + c * (cell + pad)
+        y = pad + r * (cell + pad)
+        try:
+            im = Image.open(p).convert("RGB")
+        except Exception:
+            continue
+        im.thumbnail((cell, cell))
+        canvas.paste(im, (x + (cell - im.width) // 2, y + (cell - im.height) // 2))
+    out = Path(out_path) if out_path else d / "_contact_sheet.png"
+    canvas.save(out)
+    return {"path": str(out), "images_total": len(imgs), "shown": len(sample)}
 
 
 def _extract_text(path: Path):
