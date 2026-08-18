@@ -55,6 +55,29 @@ python -m venv .venv
 cp .env.example .env      # вписать TRELLO_KEY и TRELLO_TOKEN
 ```
 
+## Установка через маркетплейс Claude (рекомендуется)
+
+Ставится и обновляется прямо в Claude, без терминала. Нужен только Python на
+машине (зависимости плагин доставит сам при первом запуске).
+
+```
+/plugin marketplace add IlyaRadn/Trello-Card-Work
+/plugin install trello-deep@duck-design
+```
+
+При установке Claude спросит **Trello API Key** (общий ключ подставлен) и **свой
+токен** (ссылка для выпуска — в подсказке). Дальше `/reload-plugins` при
+необходимости. Скиллы и MCP-сервер подключаются автоматически.
+
+**Обновление** — тоже одной командой:
+```
+/plugin update trello-deep@duck-design
+```
+
+> Зависимости ставятся хуком `SessionStart` в `${CLAUDE_PLUGIN_DATA}/pylibs`
+> (переживает обновления). Команда сервера — `python`; на macOS убедись, что
+> `python` доступен (или используй способ через `install.sh` ниже).
+
 ## Установка для команды (Windows) — быстрый способ
 
 Для коллег, кто хочет пользоваться плагином у себя. Нужен **Python 3.10+**,

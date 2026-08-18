@@ -1,22 +1,40 @@
 {
   "name": "trello-deep",
   "displayName": "Trello Deep",
-  "version": "1.0.0",
-  "description": "Читает вложения, комментарии и историю карточек Trello — то, чего не отдаёт штатный коннектор. Скачивает файлы на диск (видны нативно), умеет писать комментарии и прикреплять файлы с подтверждением.",
+  "version": "1.1.0",
+  "description": "Читает вложения, комментарии и историю карточек Trello — то, чего не отдаёт штатный коннектор. Скачивает файлы на диск (видны нативно), читает брифы PDF/docx, кэширует, умеет писать комментарии и прикреплять файлы с подтверждением.",
   "author": {
     "name": "Duck.design",
     "email": "hello@duck.design"
   },
   "homepage": "https://github.com/IlyaRadn/Trello-Card-Work",
   "license": "MIT",
-  "keywords": ["trello", "mcp", "attachments", "comments"],
+  "keywords": ["trello", "mcp", "attachments", "comments", "design"],
+  "userConfig": {
+    "trello_key": {
+      "type": "string",
+      "title": "Trello API Key",
+      "description": "API-ключ Power-Up (общий ключ команды подставлен по умолчанию).",
+      "default": "19182c221233719e958c9591183d3cee",
+      "required": true
+    },
+    "trello_token": {
+      "type": "string",
+      "title": "Trello API Token",
+      "description": "Свой токен: https://trello.com/1/authorize?expiration=30days&scope=read,write&response_type=token&name=TrelloDeep&key=19182c221233719e958c9591183d3cee",
+      "sensitive": true,
+      "required": true
+    }
+  },
+  "hooks": "./hooks/hooks.json",
   "mcpServers": {
     "trello-deep": {
       "command": "python",
       "args": ["${CLAUDE_PLUGIN_ROOT}/mcp/server.py"],
       "env": {
-        "TRELLO_KEY": "${TRELLO_KEY:-}",
-        "TRELLO_TOKEN": "${TRELLO_TOKEN:-}"
+        "PYTHONPATH": "${CLAUDE_PLUGIN_DATA}/pylibs",
+        "TRELLO_KEY": "${user_config.trello_key}",
+        "TRELLO_TOKEN": "${user_config.trello_token}"
       }
     }
   }

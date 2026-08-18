@@ -1,0 +1,19 @@
+{
+  "name": "duck-design",
+  "owner": {
+    "name": "Duck.design",
+    "email": "hello@duck.design"
+  },
+  "plugins": [
+    {
+      "name": "trello-deep",
+      "source": "./",
+      "description": "Вложения, комментарии и история карточек Trello: скачивание файлов на диск (видны нативно), чтение брифов PDF/docx, кэш, плюс дизайн-навыки.",
+      "version": "1.1.0",
+      "author": { "name": "Duck.design" },
+      "homepage": "https://github.com/IlyaRadn/Trello-Card-Work",
+      "license": "MIT",
+      "keywords": ["trello", "mcp", "attachments", "design"]
+    }
+  ]
+}
